@@ -20,7 +20,7 @@ It contains
 ## Results
 
 **Per-platform results (Windows/MSVC, Windows/mingw-w64, Windows/Clang, Linux,
-macOS/arm64) are produced by CI and published under [Releases](../../releases).**
+macOS/arm64) are produced by CI and published under [Releases]([../../releases](https://github.com/XRay3D/lazy_bench/actions/runs/37050584708)).**
 Every release contains one table per platform in the format below plus the raw
 samples as JSON.
 
