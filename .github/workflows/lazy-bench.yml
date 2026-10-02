@@ -1,0 +1,228 @@
+# Builds and runs the once-guard benchmark with every compiler:
+#   Windows - MSVC, GCC (MSYS2 UCRT64, mingw-w64), Clang (MSYS2 CLANG64, libc++);
+#   Linux   - GCC, Clang;
+#   macOS   - Apple Clang, GCC (Homebrew).
+#
+# Every job runs the tests (benchmark, contention stress test, patch check)
+# and uploads <label>.json/.md as an artifact.  A manual run or a pushed tag
+# additionally merges all platforms into one report and publishes it as a
+# release; pushes to a branch and pull requests only measure.
+name: Lazy once benchmark
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lazy-bench-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Labels of all jobs: the summary uses them to name those without results.
+  LABELS: linux-gcc,linux-clang,macos-clang,macos-gcc,windows-msvc,windows-gcc,windows-clang
+
+jobs:
+  unix:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu-26.04 rather than ubuntu-latest (still 24.04): the image
+          # with the newest compilers, and the newest of them is picked below.
+          - { label: linux-gcc, os: ubuntu-26.04, cxx: g++ }
+          - { label: linux-clang, os: ubuntu-26.04, cxx: clang++ }
+          - { label: macos-clang, os: macos-latest, cxx: clang++ }
+          - { label: macos-gcc, os: macos-latest, cxx: homebrew-gcc }
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build libboost-dev libgmp-dev libmpfr-dev
+
+      - name: Dependencies (macOS)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+          HOMEBREW_NO_INSTALL_CLEANUP: 1
+        run: brew install ninja boost gmp mpfr ${{ matrix.cxx == 'homebrew-gcc' && 'gcc' || '' }}
+
+      - name: Compiler
+        run: |
+          cxx='${{ matrix.cxx }}'
+          if [ "$cxx" = homebrew-gcc ]; then
+            # Homebrew's unversioned g++ is Apple Clang; the real one is g++-NN.
+            cxx=$(ls "$(brew --prefix gcc)"/bin/g++-[0-9]* | sort -V | tail -n 1)
+          elif [ "$RUNNER_OS" = Linux ]; then
+            # The image carries several versions; take the newest (g++-15, clang++-22).
+            newest=$(ls /usr/bin/"$cxx"-[0-9]* 2> /dev/null | sort -V | tail -n 1)
+            cxx=${newest:-$cxx}
+          fi
+          "$cxx" --version
+          echo "CXX=$cxx" >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DLAZY_BENCH_LABEL=${{ matrix.label }}
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test and measure
+        run: ctest --test-dir build -V
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: results-${{ matrix.label }}
+          path: build/results/
+          if-no-files-found: error
+
+  msys2:
+    name: ${{ matrix.label }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # UCRT64: GCC with libstdc++ on winpthreads, the case that started
+          # all this.  CLANG64: Clang with libc++.
+          - { label: windows-gcc, msystem: UCRT64, compiler: gcc, cxx: g++ }
+          - { label: windows-clang, msystem: CLANG64, compiler: clang, cxx: clang++ }
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: true
+          pacboy: >-
+            ${{ matrix.compiler }}:p cmake:p ninja:p boost:p gmp:p mpfr:p python:p
+
+      - name: Configure
+        run: |
+          ${{ matrix.cxx }} --version
+          cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} -DLAZY_BENCH_LABEL=${{ matrix.label }}
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test and measure
+        run: ctest --test-dir build -V
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: results-${{ matrix.label }}
+          path: build/results/
+          if-no-files-found: error
+
+  msvc:
+    name: windows-msvc
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-cache
+    steps:
+      - uses: actions/checkout@v7
+
+      # MSVC has no other source of Boost, GMP and MPFR than vcpkg.  The cgal
+      # port is installed for its dependencies - exactly the Boost libraries
+      # CGAL needs; the CGAL headers themselves are still the pinned release,
+      # not the vcpkg ones.  Building GMP is slow, so vcpkg's binary cache is
+      # kept between runs, keyed by the vcpkg revision of the runner image.
+      - name: vcpkg revision
+        id: vcpkg
+        run: |
+          New-Item -ItemType Directory -Force vcpkg-cache | Out-Null
+          "rev=$(git -c safe.directory=* -C $env:VCPKG_INSTALLATION_ROOT rev-parse HEAD)" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/cache@v6
+        with:
+          path: vcpkg-cache
+          key: vcpkg-x64-windows-cgal-${{ steps.vcpkg.outputs.rev }}
+          restore-keys: vcpkg-x64-windows-cgal-
+
+      - name: Dependencies
+        run: '& "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install cgal --triplet x64-windows'
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -A x64
+          "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT\scripts\buildsystems\vcpkg.cmake"
+          -DVCPKG_TARGET_TRIPLET=x64-windows
+          -DLAZY_BENCH_LABEL=windows-msvc
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test and measure
+        run: ctest --test-dir build -C Release -V
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: results-windows-msvc
+          path: build/results/
+          if-no-files-found: error
+
+  release:
+    name: Release with results
+    needs: [unix, msys2, msvc]
+    # A failed platform does not cancel the release: the summary covers the
+    # rest and names what is missing.  Only a cancelled run publishes nothing.
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || github.ref_type == 'tag') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: results-*
+          path: results
+          merge-multiple: true
+
+      - name: Summary
+        run: |
+          shopt -s nullglob
+          files=(results/*.json)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::no job produced results, nothing to publish"
+            exit 1
+          fi
+          python3 lazy_bench.py summary --out summary.md --expect "$LABELS" "${files[@]}"
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A pushed tag publishes the results under that tag; a manual run
+          # creates its own tag from the run number.
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="lazy-bench-$GITHUB_RUN_NUMBER"
+          fi
+          title="Lazy once benchmark: $tag"
+          cp summary.md results/lazy-bench-summary.md
+          # Re-running the same run updates the release it already created.
+          if gh release view "$tag" > /dev/null 2>&1; then
+            gh release edit "$tag" --title "$title" --notes-file summary.md
+            gh release upload "$tag" results/* --clobber
+          else
+            gh release create "$tag" --target "$GITHUB_SHA" --title "$title" --notes-file summary.md results/*
+          fi
