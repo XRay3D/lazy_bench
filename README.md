@@ -14,8 +14,8 @@ It contains
   compares them ([`bench_lazy.cpp`](bench_lazy.cpp), [`lazy_bench.py`](lazy_bench.py));
 * a stress test of the new `call_once` on contended flags ([`test_once.cpp`](test_once.cpp));
 * a GitHub workflow that runs all of it on Windows (MSVC, mingw-w64 GCC, Clang
-  with libc++), Linux (GCC, Clang) and macOS (Apple Clang, GCC) and publishes the
-  merged table as a [release](../../releases).
+  with libc++), Linux (GCC, Clang) and macOS (Apple Clang, GCC) and the
+  tables in https://github.com/XRay3D/lazy_bench/actions/runs/37050584708.
 
 ## Results
 
